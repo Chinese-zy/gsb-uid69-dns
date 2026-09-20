@@ -1,9 +1,17 @@
 package dnsname
 
 import (
+	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf8"
+)
+
+var (
+	ErrTruncated     = errors.New("dnsname: packet truncated")
+	ErrPointerLoop   = errors.New("dnsname: compression pointer loop")
+	ErrPointerRange  = errors.New("dnsname: compression pointer out of range")
+	ErrJunkAfterRoot = errors.New("dnsname: junk after root label")
+	ErrBadLabel      = errors.New("dnsname: invalid label length")
 )
 
 func EncodePlain(name string) []byte {
@@ -20,38 +28,50 @@ func EncodePlain(name string) []byte {
 }
 
 func Decode(pkt []byte) (string, error) {
-	s := read(pkt, 0)
-	return strings.TrimSuffix(s, "."), nil
-}
-
-func read(pkt []byte, off int) string {
 	var b strings.Builder
+	off := 0
+	jumped := false
+	seen := map[int]bool{}
 	for {
 		if off >= len(pkt) {
-			panic(fmt.Sprintf("truncated at %d", off))
+			return "", fmt.Errorf("%w: offset %d beyond %d bytes", ErrTruncated, off, len(pkt))
 		}
 		n := int(pkt[off])
 		if n == 0 {
-			if off+1 < len(pkt) {
-				panic("junk after root")
+			if !jumped && off+1 < len(pkt) {
+				return "", fmt.Errorf("%w: %d trailing bytes", ErrJunkAfterRoot, len(pkt)-off-1)
 			}
 			break
 		}
 		if n&0xC0 == 0xC0 {
 			if off+1 >= len(pkt) {
-				panic("short pointer")
+				return "", fmt.Errorf("%w: pointer at offset %d missing second byte", ErrTruncated, off)
 			}
 			ptr := int(n&0x3F)<<8 | int(pkt[off+1])
-			b.WriteString(read(pkt, ptr))
-			return b.String()
+			if ptr >= len(pkt) {
+				return "", fmt.Errorf("%w: pointer to offset %d in %d byte packet", ErrPointerRange, ptr, len(pkt))
+			}
+			if seen[ptr] {
+				return "", fmt.Errorf("%w: pointer to offset %d already visited", ErrPointerLoop, ptr)
+			}
+			seen[ptr] = true
+			off = ptr
+			jumped = true
+			continue
+		}
+		if n&0xC0 != 0 {
+			return "", fmt.Errorf("%w: reserved label type 0x%02x at offset %d", ErrBadLabel, n, off)
 		}
 		off++
+		if off+n > len(pkt) {
+			return "", fmt.Errorf("%w: label of %d bytes at offset %d exceeds %d byte packet", ErrTruncated, n, off, len(pkt))
+		}
 		label := string(pkt[off : off+n])
-		b.WriteString(strings.ToLower(label))
+		b.WriteString(label)
 		b.WriteByte('.')
 		off += n
 	}
-	return b.String()
+	return strings.TrimSuffix(b.String(), "."), nil
 }
 
 func CompressAgainst(name, earlier string) []byte {
@@ -59,7 +79,7 @@ func CompressAgainst(name, earlier string) []byte {
 	earlier = strings.TrimSuffix(earlier, ".")
 	base := EncodePlain(earlier)
 	if name == earlier {
-		return append([]byte{0xC0, 0x00}, base...)
+		return append([]byte{0xC0, 0x02}, base...)
 	}
 	suffix := "." + earlier
 	if !strings.HasSuffix(name, suffix) {
@@ -71,7 +91,7 @@ func CompressAgainst(name, earlier string) []byte {
 		out = append(out, byte(len(label)))
 		out = append(out, label...)
 	}
-	off := utf8.RuneCountInString(head)
+	off := len(out) + 2
 	out = append(out, 0xC0, byte(off))
 	return append(out, base...)
 }
